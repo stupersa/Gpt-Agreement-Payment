@@ -20,6 +20,8 @@ class StartRequest(BaseModel):
     pay_only: bool = False
     gopay: bool = False
     count: int = 0  # free_register 模式下注册次数（0 = 无限）
+    concurrent: bool = False  # batch 模式下启用并发引擎
+    reg_window: int = 3  # concurrent 窗口大小
     register_mode: str = Field(default="browser", pattern="^(browser|protocol)$")
     # 选中账号定向操作：配合 pay_only 或 rt_only
     target_emails: list[str] = []
@@ -39,6 +41,8 @@ def get_status(user: str = CurrentUser):
 def start(req: StartRequest, user: str = CurrentUser):
     if req.mode == "batch" and req.batch < 1:
         raise HTTPException(status_code=400, detail="batch 模式下批次数必须 ≥ 1")
+    if req.concurrent and req.batch < 1:
+        raise HTTPException(status_code=400, detail="concurrent 需要 batch ≥ 1")
     if req.mode == "self_dealer" and req.self_dealer < 1:
         raise HTTPException(status_code=400, detail="self_dealer 模式下成员数必须 ≥ 1")
     health = build_config_health(req.model_dump())
@@ -116,3 +120,30 @@ def preview(req: StartRequest, user: str = CurrentUser):
         req.register_only, req.pay_only, gopay=req.gopay, count=req.count,
     )
     return {"cmd": cmd, "cmd_str": " ".join(cmd)}
+
+
+# ── Decoupled worker endpoints ──
+
+class WorkerAction(BaseModel):
+    worker_type: str = Field(pattern="^(registration|payment|rt)$")
+
+
+@router.get("/workers/status")
+def get_workers_status(user: str = CurrentUser):
+    return runner.workers_status()
+
+
+@router.post("/worker/start")
+def start_worker_endpoint(req: WorkerAction, user: str = CurrentUser):
+    try:
+        return runner.start_worker(req.worker_type, gopay=True)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/worker/stop")
+def stop_worker_endpoint(req: WorkerAction, user: str = CurrentUser):
+    try:
+        return runner.stop_worker(req.worker_type)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))

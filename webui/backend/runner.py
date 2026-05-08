@@ -405,3 +405,55 @@ def get_lines_since(since_seq: int = 0, limit: int = 1000) -> list[dict]:
 def get_tail(n: int = 200) -> list[dict]:
     with _lock:
         return _log_lines[-n:]
+
+
+# ── Worker management (decoupled three-pipeline) ──
+
+_workers: dict[str, subprocess.Popen | None] = {"registration": None, "payment": None, "rt": None}
+_workers_lock = threading.Lock()
+
+
+def start_worker(worker_type: str, gopay: bool = False) -> dict:
+    if worker_type not in _workers:
+        raise ValueError(f"Unknown worker: {worker_type}")
+    with _workers_lock:
+        if _workers[worker_type] is not None and _workers[worker_type].poll() is None:
+            return {"ok": False, "detail": f"{worker_type} worker already running"}
+        import sys as _sys
+        cmd = [_sys.executable, "-u", "-m", "workers", worker_type]
+        if worker_type == "payment" and gopay:
+            cmd.append("--gopay")
+        proc = subprocess.Popen(
+            cmd, cwd=str(s.ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+        )
+        _workers[worker_type] = proc
+    return {"ok": True, "pid": proc.pid}
+
+
+def stop_worker(worker_type: str) -> dict:
+    if worker_type not in _workers:
+        raise ValueError(f"Unknown worker: {worker_type}")
+    with _workers_lock:
+        proc = _workers[worker_type]
+        if proc is None or proc.poll() is not None:
+            return {"ok": True, "detail": "already stopped"}
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill(); proc.wait()
+    with _workers_lock:
+        _workers[worker_type] = None
+    return {"ok": True}
+
+
+def workers_status() -> dict:
+    result = {}
+    for wt, proc in _workers.items():
+        running = proc is not None and proc.poll() is None
+        result[wt] = {"running": running, "pid": proc.pid if running else None}
+    return result
