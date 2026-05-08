@@ -247,13 +247,21 @@ class DomainPool:
     可选 provisioner：当可用域 < min_available 时，通过 Cloudflare API 按需开通新子域。"""
 
     def __init__(self, domains, state_key=DOMAIN_STATE_KEY, cooldown_hours=24,
-                 provisioner: "CloudflareDomainProvisioner" = None, min_available: int = 2):
+                 provisioner: "CloudflareDomainProvisioner" = None, min_available: int = 2,
+                 max_regs_per_domain: int = 20):
         self.domains = [d.strip() for d in (domains or []) if d and d.strip()]
         self.state_key = str(state_key or DOMAIN_STATE_KEY)
         self.cooldown_s = max(0, int(cooldown_hours)) * 3600
         self.state = self._load()
         self.provisioner = provisioner
         self.min_available = max(1, int(min_available))
+        self.max_regs_per_domain = max(1, int(max_regs_per_domain))
+        # Restore previously provisioned domains from persistent state (survive daemon restarts)
+        for d in self.state.get("domains", {}):
+            if d and d not in self.domains:
+                st = self.state["domains"][d].get("status", "")
+                if st != "permanent_burned":
+                    self.domains.append(d)
 
     def _load(self):
         try:
@@ -279,6 +287,9 @@ class DomainPool:
         if st == "burned":
             cd = meta.get("cooldown_until_ts", 0)
             return now_ts >= cd
+        # Check registration count limit
+        if meta.get("reg_count", 0) >= self.max_regs_per_domain:
+            return False
         return True
 
     def pick(self):
@@ -314,12 +325,21 @@ class DomainPool:
         def _last_used(d):
             return self.state["domains"].get(d, {}).get("last_used_ts", 0)
         available.sort(key=_last_used)
+        regs = self.state["domains"].get(available[0], {}).get("reg_count", 0)
+        print(f"[DomainPool] selected: {available[0]} (registered {regs}/{self.max_regs_per_domain})")
         return available[0]
 
     def mark_used(self, domain):
         meta = self.state["domains"].setdefault(domain, {})
         meta["last_used_ts"] = time.time()
         meta["last_used_iso"] = datetime.now(timezone.utc).isoformat()
+        cnt = int(meta.get("reg_count", 0)) + 1
+        meta["reg_count"] = cnt
+        if cnt >= self.max_regs_per_domain:
+            meta["status"] = "burned"
+            meta["burned_at_iso"] = datetime.now(timezone.utc).isoformat()
+            meta["cooldown_until_ts"] = time.time() + self.cooldown_s
+            print(f"[DomainPool] {domain} reached {cnt}/{self.max_regs_per_domain} registrations, auto-cooldown")
         self._save()
 
     def mark_result(self, domain, invite_status):
@@ -373,16 +393,18 @@ class DomainPool:
         rows = []
         for d in self.domains:
             m = self.state["domains"].get(d, {})
+            regs = m.get("reg_count", 0)
             st = m.get("status", "fresh")
             if st == "burned" and m.get("cooldown_until_ts", 0) <= now_ts:
                 st = "cooled"
-            rows.append((d, st, m.get("last_result", "-")))
+            rows.append((d, st, f"{regs}/{self.max_regs_per_domain}", m.get("last_result", "-")))
         # 也列出已永久 burn 的（从 pool 移除但 state 里仍有）
         for d, m in self.state.get("domains", {}).items():
             if d in self.domains:
                 continue
             if m.get("status") == "permanent_burned":
-                rows.append((d, "PERM_BURN", m.get("last_result", "-")))
+                regs = m.get("reg_count", 0)
+                rows.append((d, "PERM_BURN", f"{regs}/{self.max_regs_per_domain}", m.get("last_result", "-")))
         return rows
 
 
@@ -1097,8 +1119,8 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
     proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg)
     if pool.domains:
         print(f"[DomainPool] 域池大小={len(pool.domains)}  cooldown={cd_h}h")
-        for d, st, lr in pool.summary():
-            print(f"   - {d:40s} status={st:8s} last={lr}")
+        for d, st, regs, lr in pool.summary():
+            print(f"   - {d:40s} status={st:8s} regs={regs:12s} last={lr}")
     if team_client:
         print(f"[Team] 端点: {ts_cfg.get('base_url')}  user={ts_cfg.get('username')}")
     if proxy_pool.proxies:
@@ -1225,8 +1247,8 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
 
     if pool and pool.domains:
         print(f"\n[DomainPool] 最终状态:")
-        for d, st, lr in pool.summary():
-            print(f"   - {d:40s} status={st:8s} last={lr}")
+        for d, st, regs, lr in pool.summary():
+            print(f"   - {d:40s} status={st:8s} regs={regs:12s} last={lr}")
     return results
 
 
@@ -2388,8 +2410,10 @@ def _build_domain_pool_from_cardw(cardw_path, cooldown_hours=24):
                 pass
 
     min_avail = int(ap_cfg.get("min_available", 2))
+    max_regs = int(ap_cfg.get("max_regs_per_domain", 20))
     return DomainPool(lst, DOMAIN_STATE_KEY, cooldown_hours,
-                       provisioner=provisioner, min_available=min_avail)
+                       provisioner=provisioner, min_available=min_avail,
+                       max_regs_per_domain=max_regs)
 
 
 def _build_team_client_from_card_cfg(card_cfg):
